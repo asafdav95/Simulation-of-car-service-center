@@ -1,0 +1,543 @@
+/*
+	Asaf Davidovitch - 314863945
+	Eli Arnson - 330319294
+*/
+
+#define _CRT_SECURE_NO_WARNINGS
+#define HAVE_STRUCT_TIMESPEC
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+typedef struct request
+{
+	long license;
+	int arrival_time;
+	int amnt_treat;
+	int* treat_arr;
+}req, *Preq;
+
+typedef struct resource
+{
+	int res_id;
+	char* res_name;
+	int res_amnt;
+}res, *Pres;
+
+typedef struct service
+{
+	int treat_type;
+	char* serv_name;
+	int hours;
+	int res_amnt;
+	int* res_arr;
+}serv, *Pserv;
+
+int readServ(Pserv* services);
+int readReq(Preq* requests);
+int readRes(Pres* resources);
+void freeFunc();
+void* allClock();
+void initSemaphores();
+void reqQuickSort(Preq* requests, int low, int high);
+int partition(Preq* requests, int low, int high);
+void* initThread(void*);
+
+FILE* output;
+sem_t* semArr;
+sem_t mutex;
+Preq requests;
+Pres resources;
+Pserv services;
+int timer = 0, size_serv = 0, size_req = 0, size_res = 0;
+pthread_t* threadArr;
+
+int main()
+{
+	int i, ans;
+	pthread_t clock_t;
+
+
+	if((output = fopen("output.txt", "w")) == NULL){
+		printf("Error opening output file");
+		exit(1);
+	}
+	services = (Pserv)malloc(sizeof(serv));
+	if (!services) {
+		printf("services structure failed to malloc\n");
+		freeFunc();
+		exit(1);
+	}
+	resources = (Pres)malloc(sizeof(res));
+	if (!resources) {
+		printf("resources structure failed to malloc\n");
+		freeFunc();
+		exit(1);
+	}
+	requests = (Preq)malloc(sizeof(req));
+	if (!requests) {
+		printf("requests structure failed to malloc\n");
+		freeFunc();
+		exit(1);
+	}
+
+	size_res = size_req = size_serv = 1;
+	size_serv = readServ(&services);
+	size_req = readReq(&requests);
+	size_res = readRes(&resources);
+	if ((ans = pthread_create(&clock_t, NULL, allClock, NULL)) != 0)
+	{
+		printf("failed to create clock thread\n");
+		freeFunc();
+		exit(1);
+	}
+	initSemaphores();
+	reqQuickSort(&requests, 0, size_req - 1);//Sort the requests according to arrival time
+	for (i = 0; i < size_req; i++)//Loop to create all the cars (threads)
+	{
+		if ((ans = pthread_create(&threadArr[i], NULL, initThread, (void*)(&requests[i]))) == -1)
+		{
+			printf("failed to create car thread\n");
+			freeFunc();
+			exit(1);
+		}
+	}
+	for(i = 0; i < size_req; i++)
+	{
+		pthread_join(threadArr[i], 0);
+	}
+	fclose(output);
+	freeFunc();
+	return 0;
+}
+
+
+
+//Function to read and save all the services data
+int readServ(Pserv* services)
+{
+	int fd, rbytes, buff_inx, line_inx, ser_amnt = 1, i, ser_res_arr_inx;
+	//buff_inx - keeps track on the current buffer index,	line_inx - keeps track of where we are at the line
+	//ser_amnt - amount of different services,	ser_res_arr_inx - keeps track on the current allocated array index
+	char buff[256] = {'\0'}, last_c;
+	if ((fd = open("services.txt", O_RDONLY, 0664)) == -1)
+	{
+		perror("open to f_serv");
+		freeFunc();
+		exit(1);
+	}
+	if ((rbytes = read(fd, &last_c, 1)) == -1) {
+		perror("services read");
+		freeFunc();
+		exit(1);
+	}
+	while (rbytes > 0) {	//while not EOF
+		line_inx = 0;
+		ser_res_arr_inx = 0;
+		*services = (Pserv)realloc(*services, sizeof(serv) * ser_amnt);
+		if (!*services) {
+			printf("services structure failed to realloc\n");
+			freeFunc();
+			exit(1);
+		}
+
+		while (last_c != '\n' && rbytes > 0) {	//while for each line
+			buff_inx = 0;
+			while (last_c != '\t' && last_c != '\n' && rbytes > 0) {	//while for reading a part from the line
+				buff[buff_inx++] = last_c;
+				if ((rbytes = read(fd, &last_c, 1)) == -1){
+					perror("services read");
+					freeFunc();
+					exit(1);
+				}
+			}
+			switch (line_inx)
+			{
+			case 0:	//saves treatment type
+				(*services)[ser_amnt - 1].treat_type = atoi(buff);
+				break;
+			case 1:	//saves the service's name
+				(*services)[ser_amnt - 1].serv_name = (char*)malloc(strlen(buff) + 1);
+				if (!(*services)[ser_amnt - 1].serv_name) {
+					printf("Failed memory allocation for service name\n");
+					freeFunc();
+					exit(1);
+				}
+				strcpy((*services)[ser_amnt - 1].serv_name, buff);
+				break;
+			case 2:	//saves num of hours
+				(*services)[ser_amnt - 1].hours = atoi(buff);
+				break;
+			case 3:	//saves amount of resources
+				(*services)[ser_amnt - 1].res_amnt = atoi(buff);
+				(*services)[ser_amnt - 1].res_arr = (int*)malloc((*services)[ser_amnt - 1].res_amnt * sizeof(int));
+				if (!(*services)[ser_amnt - 1].res_arr) {
+					printf("Allocation error for a new service's resources array\n");
+					freeFunc();
+					exit(1);
+				}
+				break;
+			default:	//saves each resource
+				(*services)[ser_amnt - 1].res_arr[ser_res_arr_inx++] = atoi(buff);
+			}
+			for (i = 0; i < buff_inx; i++) {	// Reseting the buffer
+				buff[i] = '\0';
+			}
+			line_inx++;
+			if (last_c != '\n') {
+				if ((rbytes = read(fd, &last_c, 1)) == -1) {
+					perror("services read");
+					freeFunc();
+					exit(1);
+				}
+			}
+		}
+		ser_amnt++;
+		if ((rbytes = read(fd, &last_c, 1)) == -1) {
+			perror("services read");
+			freeFunc();
+			exit(1);
+		}
+	}
+	close(fd);
+	return ser_amnt - 2;
+}
+
+
+//Function to read and save all the requests data
+int readReq(Preq* requests)
+{
+	int fd, rbytes, buff_inx, line_inx, req_amnt = 1, i, req_treat_arr_inx;
+	//buff_inx - keeps track on the current buffer index,	line_inx - keeps track of where we are at the line
+	//req_amnt - amount of different requests,	req_treat_arr_inx - keeps track on the current allocated array index
+	char buff[256] = { '\0' }, last_c;
+	if ((fd = open("requests.txt", O_RDONLY, 0664)) == -1)
+	{
+		perror("open to f_req");
+		freeFunc();
+		exit(1);
+	}
+	if ((rbytes = read(fd, &last_c, 1)) == -1) {
+		perror("requests read");
+		freeFunc();
+		exit(1);
+	}
+	while (rbytes > 0) {	//while not EOF
+		line_inx = 0;
+		req_treat_arr_inx = 0;
+		*requests = (Preq)realloc(*requests, sizeof(req) * req_amnt);
+		if (!*requests) {
+			printf("requests structure failed to realloc\n");
+			freeFunc();
+			exit(1);
+		}
+		while (last_c != '\n' && rbytes > 0) {	//while for each line
+			buff_inx = 0;
+			while (last_c != '\t' && last_c != '\n' && rbytes > 0) {	//while for reading a part from the line
+				buff[buff_inx++] = last_c;
+				if ((rbytes = read(fd, &last_c, 1)) == -1) {
+					perror("requests read");
+					freeFunc();
+					exit(1);
+				}
+			}
+			switch (line_inx)
+			{
+			case 0:	//saces the request's lisence
+				(*requests)[req_amnt - 1].license = atol(buff);
+				break;
+			case 1:	//saves the request's arrival time
+				(*requests)[req_amnt - 1].arrival_time = atoi(buff);
+				break;
+			case 2:	//saves the amount of needed treatments
+				(*requests)[req_amnt - 1].amnt_treat = atoi(buff);
+				(*requests)[req_amnt - 1].treat_arr = (int*)malloc((*requests)[req_amnt - 1].amnt_treat * sizeof(int));
+				if (!(*requests)[req_amnt - 1].treat_arr) {
+					printf("Allocation error for a new request's resources array\n");
+					freeFunc();
+					exit(1);
+				}
+				break;
+			default:	//saves each treatment
+				(*requests)[req_amnt - 1].treat_arr[req_treat_arr_inx++] = atoi(buff);
+			}
+			for (i = 0; i < buff_inx; i++) {// Reseting the buffer
+				buff[i] = '\0';
+			}
+			line_inx++;
+			if (last_c != '\n') {
+				if ((rbytes = read(fd, &last_c, 1)) == -1) {
+					perror("request read");
+					freeFunc();
+					exit(1);
+				}
+			}
+		}
+
+		req_amnt++;
+		if ((rbytes = read(fd, &last_c, 1)) == -1) {
+			perror("request read");
+			freeFunc();
+			exit(1);
+		}
+	}
+	close(fd);
+	return req_amnt - 2;
+}
+
+
+//Function to read and save all the resources data
+int readRes(Pres* resources)
+{
+	int fd, rbytes, buff_inx, line_inx, res_amnt = 1, i;
+	//buff_inx - keeps track on the current buffer index,	line_inx - keeps track of where we are at the line
+	//res_amnt - amount of different resources
+	char buff[256] = { '\0' }, last_c;
+	if ((fd = open("resources.txt", O_RDONLY, 0664)) == -1)
+	{
+		perror("open to f_res");
+		freeFunc();
+		exit(1);
+	}
+	if ((rbytes = read(fd, &last_c, 1)) == -1) {
+		perror("resources read");
+		freeFunc();
+		exit(1);
+	}
+	while (rbytes > 0) {	//while not EOF
+		line_inx = 0;
+		*resources = (Pres)realloc(*resources, sizeof(res) * res_amnt);
+		if (!*resources) {
+			printf("resources structure failed to realloc\n");
+			freeFunc();
+			exit(1);
+		}
+		while (last_c != '\n' && rbytes > 0) {	//while for each line
+			buff_inx = 0;
+			while (last_c != '\t' && last_c != '\n' && rbytes > 0) {	//while for reading a part from the line
+				buff[buff_inx++] = last_c;
+				if ((rbytes = read(fd, &last_c, 1)) == -1) {
+					perror("resources read");
+					freeFunc();
+					exit(1);
+				}
+			}
+			switch (line_inx)
+			{
+			case 0:	//saves resource's id
+				(*resources)[res_amnt - 1].res_id = atoi(buff);
+				break;
+			case 1:	//saves resource's name
+				(*resources)[res_amnt - 1].res_name = (char*)malloc(strlen(buff) + 1);
+				if (!(*resources)[res_amnt - 1].res_name) {
+					printf("Failed memory allocation for resource name\n");
+					freeFunc();
+					exit(1);
+				}
+				strcpy((*resources)[res_amnt - 1].res_name, buff);
+				break;
+			case 2:	//saves the amount of this resource
+				(*resources)[res_amnt - 1].res_amnt = atoi(buff);
+				break;
+			}
+			for (i = 0; i < buff_inx; i++) {// Reseting the buffer
+				buff[i] = '\0';
+			}
+			line_inx++;
+			if (last_c != '\n') {
+				if ((rbytes = read(fd, &last_c, 1)) == -1) {
+					perror("resources read");
+					freeFunc();
+					exit(1);
+				}
+			}
+		}
+
+		res_amnt++;
+		if ((rbytes = read(fd, &last_c, 1)) == -1) {
+			perror("resources read");
+			freeFunc();
+			exit(1);
+		}
+	}
+	close(fd);
+	return res_amnt - 1;
+}
+
+
+//Function to free all memomry allocations
+void freeFunc()
+{
+	int i;
+	if (size_serv > 0) {
+		for (i = 0; i < size_serv; i++) {
+			free(services[i].serv_name);
+			free(services[i].res_arr);
+		}
+		free(services);
+	}
+	if (size_req > 0) {
+		for (i = 0; i < size_req; i++) {
+			free(requests[i].treat_arr);
+		}
+		free(requests);
+	}
+	if (size_res > 0) {
+		for (i = 0; i < size_res; i++) {
+			free(resources[i].res_name);
+		}
+		free(resources);
+	}
+	if (semArr)
+		free(semArr);
+	if (threadArr)
+	{
+		free(threadArr);
+	}
+}
+
+
+//Function to operate the system's clock
+void* allClock()
+{
+	while (1 == 1) {
+		sleep(1);
+		timer++;
+	}
+}
+
+
+//Function to initialze all the semaphores and availableResArr
+void initSemaphores()
+{
+	int max_res = 0, i;
+	sem_init(&mutex, 0, 1);
+	for (i = 0; i < size_res; i++)		//Loop to find the max resource is for the malloc
+	{
+		if (resources[i].res_id > max_res)
+			max_res = resources[i].res_id;
+	}
+	semArr = (sem_t*)malloc(sizeof(sem_t) * (max_res + 1));	//Initialize the semaphores array
+	if (!semArr)
+	{
+		printf("Allocation error for semArr\n");
+		freeFunc();
+		exit(1);
+	}
+	threadArr = (pthread_t*)malloc(sizeof(pthread_t) * size_req);	//Initialize the threads array array
+	if (!threadArr)
+	{
+		printf("Allocation error for threadArr\n");
+		freeFunc();
+		exit(1);
+	}
+	for (i = 0; i < size_res; i++)		////Initialize the semaphores to their's correct values
+		sem_init(&semArr[resources[i].res_id], 0, resources[i].res_amnt);
+}
+
+
+
+//Function to sort the requests array
+void reqQuickSort(Preq* requests, int low, int high)
+{
+	int pi;
+	if (low < high)
+	{
+		pi = partition(requests, low, high);
+		reqQuickSort(requests, low, pi - 1);
+		reqQuickSort(requests, pi + 1, high);
+	}
+}
+
+int partition(Preq* requests, int low, int high)
+{
+	int i, j;
+	req temp;
+	req pivot = (*requests)[high];
+	i = (low - 1);
+	for (j = low; j <= high - 1; j++)
+	{
+		if ((*requests)[j].arrival_time < pivot.arrival_time)
+		{
+			i++;
+			temp = (*requests)[j];
+			(*requests)[j] = (*requests)[i];
+			(*requests)[i] = temp;
+		}
+	}
+	temp = (*requests)[i + 1];
+	(*requests)[i + 1] = (*requests)[high];
+	(*requests)[high] = temp;
+	return (i + 1);
+}
+
+
+//Function to start the system
+void* initThread(void* singleReq)
+{
+	int i, j, k, cntAvailableRes, temp, cnt_done_treat = 0;
+	req req = *(Preq)singleReq;
+	while (req.arrival_time > timer)	//Loop to stall the request until it's arrival time
+	{
+		sleep(1);
+	}
+	fprintf(output, "car: %ld time: %d arrived.\n", req.license, timer);
+	printf("car: %ld time: %d arrived.\n", req.license, timer);
+	while (1 == 1)
+	{
+		for (i = 0; i < req.amnt_treat; i++)	//Loop to run on request treatments array
+		{
+			for (j = 0; j < size_serv; j++)		//Loop to find the treatment in services array
+			{
+				if (req.treat_arr[i] == services[j].treat_type && req.treat_arr[i] != 0)//Entering the correct service
+				{
+					sem_wait(&mutex);
+					cntAvailableRes = 0; // Count how many available resources for this service
+					for (k = 0; k < services[j].res_amnt; k++)//Check each resource if available
+					{
+						sem_getvalue(&semArr[services[j].res_arr[k]], &temp);
+						if (temp > 0)
+							cntAvailableRes++;
+					}
+					fprintf(output, "car: %ld time: %d check if we can start request.\n", req.license, timer);
+					printf("car: %ld time: %d check if we can start request.\n", req.license, timer);
+					if (cntAvailableRes == services[j].res_amnt)//If we have all the required resources
+					{
+						for (k = 0; k < services[j].res_amnt; k++)//Take resources
+						{
+							sem_wait(&semArr[services[j].res_arr[k]]);	//sem_wait the service semaphore
+						}
+						sem_post(&mutex);
+						fprintf(output, "car: %ld time: %d started %s.\n", req.license, timer, services[j].serv_name);	//v
+						printf("car: %ld time: %d started %s.\n", req.license, timer, services[j].serv_name);	//
+						sleep(services[j].hours);																//Do service
+						fprintf(output, "car: %ld time: %d started %s.\n", req.license, timer, services[j].serv_name);	//
+						printf("car: %ld time: %d completed %s.\n", req.license, timer, services[j].serv_name);	//
+						req.treat_arr[i] = 0;
+						for (k = 0; k < services[j].res_amnt; k++)//Take resources
+						{
+							sem_post(&semArr[services[j].res_arr[k]]);	//sem_post the service semaphore
+						}
+						cnt_done_treat++;
+					}
+					else
+						sem_post(&mutex);
+				}
+				if(cnt_done_treat == req.amnt_treat)
+				{
+					fprintf(output, "car: %ld time: %d service complete.\n", req.license, timer);
+					printf("car: %ld time: %d service complete.\n", req.license, timer);
+					return NULL;
+				}
+			}
+			sleep(1);
+		}
+	}
+}
+
+
+
